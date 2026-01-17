@@ -1586,11 +1586,14 @@
 
       createApp({
         data() {
+          const storedLang = localStorage.getItem("hz_lang");
+          const browserLang = (navigator.language || "").toLowerCase();
+          const defaultLang = storedLang || (browserLang.startsWith("zh") ? "zh" : "en");
           return {
             username: localStorage.getItem("hz_user") || "",
             password: localStorage.getItem("hz_pass") || "",
             authed: false,
-            lang: localStorage.getItem("hz_lang") || "en",
+            lang: defaultLang,
             servers: [],
             serverFilter: "",
             serverSort: "outbound_desc",
