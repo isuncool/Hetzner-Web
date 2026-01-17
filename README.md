@@ -1,5 +1,8 @@
 # Hetzner Web
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/Docker-ready-2496ED)](#quick-start-docker)
+
 A lightweight Hetzner traffic console with daily/hourly views, rebuild actions, DNS checks, and a clean dashboard.
 
 ## Features
@@ -10,6 +13,14 @@ A lightweight Hetzner traffic console with daily/hourly views, rebuild actions, 
 - Trend sparkline per server
 - Traffic bar chart (outbound/inbound)
 - Basic Auth login
+
+## Screenshots
+
+Place your screenshot at `docs/screenshot.png` and add it here:
+
+```md
+![Dashboard](docs/screenshot.png)
+```
 
 ## Quick Start (Docker)
 
@@ -24,6 +35,26 @@ docker compose up -d --build
 
 Open: `http://<server-ip>:1227`
 
+## Reverse Proxy (Nginx example)
+
+```nginx
+server {
+  listen 443 ssl;
+  server_name hz.example.com;
+
+  ssl_certificate /path/to/fullchain.pem;
+  ssl_certificate_key /path/to/privkey.pem;
+
+  location / {
+    proxy_pass http://127.0.0.1:1227;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+```
+
 ## Configuration
 
 ### `config.yaml`
@@ -35,6 +66,12 @@ Open: `http://<server-ip>:1227`
 ### `web_config.json`
 - `username` / `password`: Basic Auth credentials
 - `tracking_start`: optional, e.g. `2026-01-01 00:00`
+
+## Security Notes
+
+- Keep `config.yaml` and `web_config.json` private (they are gitignored).
+- Use HTTPS behind a reverse proxy.
+- Consider IP allowlisting for the panel.
 
 ## Notes
 
