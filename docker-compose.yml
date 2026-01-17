@@ -10,6 +10,6 @@ services:
     ports:
       - "1227:1227"
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
-      - ./report_state.json:/app/report_state.json:ro
+      - ./config.yaml:/app/config.yaml
+      - ./report_state.json:/app/report_state.json
       - ./web_config.json:/app/web_config.json:ro

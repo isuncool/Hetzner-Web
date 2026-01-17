@@ -6,7 +6,7 @@ import os
 import socket
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
@@ -25,13 +25,18 @@ REPORT_STATE_PATH = os.environ.get("REPORT_STATE_PATH", "/app/report_state.json"
 
 ALERT_STATE: Dict[str, Dict[str, Optional[float]]] = {}
 REBUILD_LOCKS: Dict[str, threading.Lock] = {}
-SCHEDULE_STATE: Dict[str, Optional[str]] = {"last_daily_report": None}
+SCHEDULE_STATE: Dict[str, Any] = {"last_daily_report": None, "last_task_runs": {}}
 BOT_STATE: Dict[str, int] = {"update_offset": 0}
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r") as f:
         return yaml.safe_load(f) or {}
+
+
+def _save_yaml(path: str, data: Dict[str, Any]) -> None:
+    with open(path, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=False)
 
 
 def _load_json(path: str) -> Dict[str, Any]:
@@ -43,6 +48,21 @@ def _load_json(path: str) -> Dict[str, Any]:
 
 def _now_local() -> datetime:
     return datetime.now().astimezone()
+
+
+def _load_report_state() -> Dict[str, Any]:
+    if not os.path.exists(REPORT_STATE_PATH):
+        return {}
+    try:
+        with open(REPORT_STATE_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_report_state(state: Dict[str, Any]) -> None:
+    with open(REPORT_STATE_PATH, "w") as f:
+        json.dump(state, f)
 
 
 def _bytes_to_tb(value_bytes: float) -> Decimal:
@@ -284,6 +304,27 @@ class HetznerClient:
         except Exception:
             return False
 
+    def power_on_server(self, server_id: int) -> bool:
+        try:
+            self._request("POST", f"servers/{server_id}/actions/poweron")
+            return True
+        except Exception:
+            return False
+
+    def power_off_server(self, server_id: int) -> bool:
+        try:
+            self._request("POST", f"servers/{server_id}/actions/poweroff")
+            return True
+        except Exception:
+            return False
+
+    def reboot_server(self, server_id: int) -> bool:
+        try:
+            self._request("POST", f"servers/{server_id}/actions/reboot")
+            return True
+        except Exception:
+            return False
+
     def get_snapshots(self) -> List[Dict[str, Any]]:
         try:
             data = self._request("GET", "images", params={"type": "snapshot"})
@@ -292,6 +333,40 @@ class HetznerClient:
             return snapshots
         except Exception:
             return []
+
+    def create_snapshot(self, server_id: int, description: str = "") -> Optional[Dict[str, Any]]:
+        try:
+            payload: Dict[str, Any] = {"type": "snapshot"}
+            if description:
+                payload["description"] = description
+            data = self._request("POST", f"servers/{server_id}/actions/create_image", json=payload)
+            return data.get("image")
+        except Exception:
+            return None
+
+    def create_server_from_snapshot(
+        self,
+        name: str,
+        server_type: str,
+        location: str,
+        snapshot_id: int,
+        ssh_keys: Optional[List[int]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not server_type or not location:
+            return None
+        payload: Dict[str, Any] = {
+            "name": name,
+            "server_type": server_type,
+            "location": location,
+            "image": snapshot_id,
+        }
+        if ssh_keys:
+            payload["ssh_keys"] = ssh_keys
+        try:
+            data = self._request("POST", "servers", json=payload)
+            return data.get("server")
+        except Exception:
+            return None
 
     def rebuild_server(self, server_id: int, config: Dict[str, Any]) -> Dict[str, Any]:
         old_server = self.get_server(server_id)
@@ -529,6 +604,121 @@ def _build_daily_report(config: Dict[str, Any], client: "HetznerClient") -> str:
     return "\n".join(lines)
 
 
+def _collect_traffic_snapshot(client: "HetznerClient") -> Dict[str, Any]:
+    servers = client.get_servers()
+    snapshot: Dict[str, Any] = {}
+    for server in servers:
+        sid = str(server["id"])
+        detail = client.get_server(server["id"]) or {}
+        snapshot[sid] = {
+            "name": detail.get("name") or server.get("name") or sid,
+            "outbound_bytes": detail.get("outgoing_traffic"),
+            "inbound_bytes": detail.get("ingoing_traffic"),
+        }
+    return snapshot
+
+
+def _record_hourly_snapshot(state: Dict[str, Any], now: datetime, client: "HetznerClient") -> None:
+    hour_key = now.strftime("%Y-%m-%d %H:00")
+    hourly = state.get("hourly", {})
+    if hour_key in hourly:
+        return
+    hourly[hour_key] = _collect_traffic_snapshot(client)
+    state["hourly"] = hourly
+
+
+def _format_hourly_report(hourly: Dict[str, Any], hours: int = 24) -> str:
+    if not hourly:
+        return "小时分析: 暂无数据"
+    keys = sorted(hourly.keys())
+    keys = keys[-(hours + 1):]
+    if len(keys) < 2:
+        return "小时分析: 数据不足"
+
+    servers: Dict[str, Any] = {}
+    for i in range(1, len(keys)):
+        prev_key = keys[i - 1]
+        curr_key = keys[i]
+        prev = hourly.get(prev_key, {})
+        curr = hourly.get(curr_key, {})
+        for sid, data in curr.items():
+            if sid not in servers:
+                servers[sid] = {"name": data.get("name", sid), "deltas": []}
+            prev_out = prev.get(sid, {}).get("outbound_bytes")
+            curr_out = data.get("outbound_bytes")
+            if prev_out is None or curr_out is None or float(curr_out) < float(prev_out):
+                delta_tb = None
+            else:
+                delta_tb = _bytes_to_tb(float(curr_out) - float(prev_out))
+            servers[sid]["deltas"].append((curr_key[-5:], delta_tb))
+
+    parts = ["🕘 *每小时出站(最近24h)*"]
+    for data in servers.values():
+        lines = [f"🖥 *{data['name']}*"]
+        for label, delta_tb in data["deltas"]:
+            val = f"{delta_tb} TB" if delta_tb is not None else "N/A"
+            lines.append(f"{label}: {val}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def _build_manual_report(config: Dict[str, Any], client: "HetznerClient") -> str:
+    now = _now_local()
+    state = _load_report_state()
+    _record_hourly_snapshot(state, now, client)
+
+    last_time = state.get("last_time")
+    last_snapshot = state.get("servers", {})
+    current_snapshot = _collect_traffic_snapshot(client)
+
+    traffic_cfg = config.get("traffic", {})
+    limit_gb = traffic_cfg.get("limit_gb")
+    limit_tb = None
+    if limit_gb:
+        try:
+            limit_tb = (Decimal(limit_gb) / Decimal(1024)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+        except Exception:
+            limit_tb = None
+
+    parts = ["🕒 *手动流量汇报*"]
+    if last_time:
+        parts.append(f"统计区间: {last_time} ~ {now.strftime('%Y-%m-%d %H:%M')}")
+    else:
+        parts.append("统计区间: 首次统计（仅显示累计出站）")
+
+    for sid, data in current_snapshot.items():
+        outbound = data.get("outbound_bytes")
+        inbound = data.get("inbound_bytes")
+        total_tb = _bytes_to_tb(float(outbound)) if outbound is not None else Decimal("0.000")
+        usage = None
+        if limit_tb and outbound is not None:
+            usage = float((Decimal(outbound) / (Decimal(1024) ** 4) / limit_tb) * 100)
+
+        last = last_snapshot.get(sid, {})
+        last_out = last.get("outbound_bytes")
+        delta_tb = None
+        if outbound is not None and last_out is not None:
+            delta = float(outbound) - float(last_out)
+            if delta >= 0:
+                delta_tb = _bytes_to_tb(delta)
+
+        usage_text = f"{usage:.2f}%" if usage is not None else "N/A"
+        delta_text = f"{delta_tb} TB" if delta_tb is not None else "N/A"
+        inbound_tb = _bytes_to_tb(float(inbound)) if inbound is not None else Decimal("0.000")
+        parts.append(
+            f"🖥 *{data.get('name')}* (`{sid}`)\n"
+            f"💾 累计出站: *{total_tb} TB* / {limit_tb if limit_tb is not None else 'N/A'} TB\n"
+            f"📈 使用率: *{usage_text}*\n"
+            f"📊 区间增量: *{delta_text}*\n"
+            f"📥 入站: {inbound_tb} TB"
+        )
+
+    parts.append(_format_hourly_report(state.get("hourly", {})))
+    state["last_time"] = now.strftime("%Y-%m-%d %H:%M")
+    state["servers"] = current_snapshot
+    _save_report_state(state)
+    return "\n\n".join(parts)
+
 def _perform_rebuild(
     server_id: int, server_name: str, config: Dict[str, Any], source: str, client: "HetznerClient"
 ) -> Dict[str, Any]:
@@ -613,6 +803,138 @@ def _sync_cloudflare_records(config: Dict[str, Any], client: "HetznerClient") ->
     return {"updated": updated, "skipped": skipped}
 
 
+def _normalize_scheduler_tasks(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    scheduler_cfg = config.get("scheduler", {}) or {}
+    tasks = scheduler_cfg.get("tasks")
+    if isinstance(tasks, list) and tasks:
+        return tasks
+    delete_time = scheduler_cfg.get("delete_time")
+    create_time = scheduler_cfg.get("create_time")
+    normalized: List[Dict[str, Any]] = []
+    if delete_time:
+        normalized.append({"action": "delete_all", "times": [delete_time] if isinstance(delete_time, str) else delete_time})
+    if create_time:
+        normalized.append({"action": "create_from_snapshots", "times": [create_time] if isinstance(create_time, str) else create_time})
+    return normalized
+
+
+def _delete_all_servers(config: Dict[str, Any], client: "HetznerClient") -> None:
+    whitelist_ids = set(str(x) for x in (config.get("whitelist", {}).get("server_ids") or []))
+    whitelist_names = set(config.get("whitelist", {}).get("server_names") or [])
+    servers = client.get_servers()
+    for server in servers:
+        sid = str(server["id"])
+        if sid in whitelist_ids or server.get("name") in whitelist_names:
+            continue
+        client.delete_server(server["id"])
+        time.sleep(1)
+
+
+def _update_config_mapping(config: Dict[str, Any], old_id: str, new_id: str) -> None:
+    rebuild_cfg = config.get("rebuild", {}) or {}
+    snapshot_map = rebuild_cfg.get("snapshot_id_map", {}) or {}
+    if old_id in snapshot_map:
+        snapshot_map[new_id] = snapshot_map[old_id]
+        snapshot_map.pop(old_id, None)
+        rebuild_cfg["snapshot_id_map"] = snapshot_map
+        config["rebuild"] = rebuild_cfg
+
+    cf_cfg = config.get("cloudflare", {}) or {}
+    record_map = cf_cfg.get("record_map", {}) or {}
+    if old_id in record_map:
+        record_map[new_id] = record_map[old_id]
+        record_map.pop(old_id, None)
+        cf_cfg["record_map"] = record_map
+        config["cloudflare"] = cf_cfg
+
+
+def _create_from_snapshot_map(config: Dict[str, Any], client: "HetznerClient") -> None:
+    rebuild_cfg = config.get("rebuild", {}) or {}
+    snapshot_map = rebuild_cfg.get("snapshot_id_map", {}) or {}
+    if not snapshot_map:
+        return
+
+    template = rebuild_cfg.get("fallback_template", {}) or {}
+    server_type = template.get("server_type")
+    location = template.get("location")
+    ssh_keys = template.get("ssh_keys") or []
+
+    cf_cfg = config.get("cloudflare", {}) or {}
+    record_map = cf_cfg.get("record_map", {}) or {}
+
+    for old_id, snapshot_id in snapshot_map.items():
+        record_cfg = record_map.get(str(old_id))
+        record = None
+        if isinstance(record_cfg, dict):
+            record = record_cfg.get("record") or record_cfg.get("name")
+        elif isinstance(record_cfg, str):
+            record = record_cfg
+        if record:
+            name = record.split(".", 1)[0]
+        else:
+            name = f"auto-{old_id}"
+
+        created = client.create_server_from_snapshot(
+            name=name,
+            server_type=server_type,
+            location=location,
+            snapshot_id=int(snapshot_id),
+            ssh_keys=ssh_keys,
+        )
+        if not created:
+            continue
+        new_id = str(created.get("id"))
+        new_ip = (created.get("public_net") or {}).get("ipv4", {}).get("ip")
+        if new_id:
+            _update_config_mapping(config, str(old_id), new_id)
+            resolved = _resolve_cf_record(record_cfg, cf_cfg.get("zone_id", ""), cf_cfg.get("api_token", ""))
+            if resolved and new_ip:
+                client.update_cloudflare_a_record(
+                    resolved["api_token"], resolved["zone_id"], resolved["record"], new_ip
+                )
+
+
+def _run_schedule_task(action: str, config: Dict[str, Any], client: "HetznerClient") -> None:
+    if action == "delete_all":
+        _delete_all_servers(config, client)
+    elif action == "create_from_snapshots":
+        _create_from_snapshot_map(config, client)
+
+
+def _schedule_loop() -> None:
+    while True:
+        try:
+            config = _load_yaml(CONFIG_PATH)
+            scheduler_cfg = config.get("scheduler", {}) or {}
+            if not scheduler_cfg.get("enabled"):
+                time.sleep(30)
+                continue
+            tasks = _normalize_scheduler_tasks(config)
+            if not tasks:
+                time.sleep(30)
+                continue
+
+            now = _now_local()
+            current_time = now.strftime("%H:%M")
+            current_date = now.strftime("%Y-%m-%d")
+            last_runs = SCHEDULE_STATE.setdefault("last_task_runs", {})
+
+            for task in tasks:
+                action = task.get("action")
+                times = task.get("times") or []
+                if isinstance(times, str):
+                    times = [times]
+                for t in times:
+                    key = f"{action}:{t}"
+                    if current_time == t and last_runs.get(key) != current_date:
+                        client = HetznerClient(config["hetzner"]["api_token"])
+                        _run_schedule_task(action, config, client)
+                        _save_yaml(CONFIG_PATH, config)
+                        last_runs[key] = current_date
+        except Exception as e:
+            print(f"[alert] schedule error: {e}")
+        time.sleep(20)
+
 def _monitor_traffic_loop() -> None:
     while True:
         try:
@@ -675,7 +997,7 @@ def _monitor_traffic_loop() -> None:
                     if _send_telegram_message(bot_token, chat_id, message):
                         state["last_level"] = int(new_level)
 
-                if exceed_action == "rebuild" and float(outgoing) >= limit_bytes:
+                if exceed_action in ("rebuild", "delete_rebuild") and float(outgoing) >= limit_bytes:
                     if not state.get("auto_rebuild"):
                         server_name = detail.get("name") or s.get("name") or sid
                         result = _perform_rebuild(
@@ -686,6 +1008,10 @@ def _monitor_traffic_loop() -> None:
                             client,
                         )
                         if result.get("success"):
+                            state["auto_rebuild"] = True
+                elif exceed_action == "delete" and float(outgoing) >= limit_bytes:
+                    if not state.get("auto_rebuild"):
+                        if client.delete_server(s["id"]):
                             state["auto_rebuild"] = True
         except Exception as e:
             print(f"[alert] monitor error: {e}")
@@ -721,48 +1047,362 @@ def _daily_report_loop() -> None:
 
 def _handle_bot_command(text: str, config: Dict[str, Any], client: "HetznerClient") -> str:
     cmd = (text or "").strip()
-    if cmd.startswith("/start") or cmd.startswith("/help"):
-        return "🤖 监控已启动\n/status 或 /ll 查看战报\n/servers 查看服务器\n/dnsync 同步 DNS\n/rebuild 服务器名 执行重建"
-    if cmd.startswith("/ll") or cmd.startswith("/status"):
-        return _build_daily_report(config, client)
-    if cmd.startswith("/servers"):
+    if not cmd:
+        return "⚠️ 未知指令"
+    parts = cmd.split()
+    command = parts[0].split("@")[0]
+    args = parts[1:]
+
+    if command in ("/start", "/help"):
+        return (
+            "📖 **命令大全**\n\n"
+            "📊 查询类:\n"
+            "/list - 🖥 服务器列表\n"
+            "/status - 📈 系统状态\n"
+            "/traffic ID - 📊 流量详情(无ID显示全部)\n"
+            "/today ID - 📅 今日流量(无ID显示全部)\n"
+            "/report - 🕒 手动流量汇报\n"
+            "/reportstatus - 📋 上次汇报时间\n"
+            "/reportreset - ♻️ 重置汇报区间\n"
+            "/dnstest ID - 🔧 测试DNS更新\n"
+            "/dnscheck ID - ✅ DNS解析检查\n\n"
+            "🔧 控制类:\n"
+            "/startserver <ID> - ▶️ 启动服务器\n"
+            "/stopserver <ID> - ⏸️ 停止服务器\n"
+            "/reboot <ID> - 🔄 重启服务器\n"
+            "/delete <ID> confirm - 🗑 删除服务器\n"
+            "/rebuild <ID> - 🔨 重建服务器\n\n"
+            "💾 快照管理:\n"
+            "/snapshots - 📦 查看所有快照\n"
+            "/createsnapshot <ID> - 📸 手动创建快照\n\n"
+            "⏰ 定时任务:\n"
+            "/scheduleon - ✅ 开启定时删机\n"
+            "/scheduleoff - ⏸️ 关闭定时删机\n"
+            "/schedulestatus - 📋 查看定时状态\n"
+            "/scheduleset delete=23:50,01:00 create=08:00,09:00 - 设置定时\n\n"
+            "💡 服务器ID从 /list 获取"
+        )
+
+    if command == "/list":
         servers = client.get_servers()
+        if not servers:
+            return "📭 暂无服务器"
+        lines = ["🖥 **服务器列表**"]
+        for s in servers:
+            ip = s.get("public_net", {}).get("ipv4", {}).get("ip", "N/A")
+            status = "🟢 运行中" if s.get("status") == "running" else "🔴 已停止"
+            lines.append(
+                f"{status}\n"
+                f"📛 `{s.get('name')}`\n"
+                f"🆔 `{s.get('id')}`\n"
+                f"🌐 `{ip}`"
+            )
+        return "\n".join(lines)
+
+    if command in ("/status", "/ll"):
+        servers = client.get_servers()
+        total = len(servers)
+        running = sum(1 for s in servers if s.get("status") == "running")
+        return (
+            "📊 **系统状态概览**\n\n"
+            f"🖥 服务器总数: {total} 台\n"
+            f"🟢 运行中: {running} 台\n"
+            f"🔴 已停止: {total - running} 台"
+        )
+
+    if command == "/traffic":
         traffic_cfg = config.get("traffic", {})
         limit_gb = traffic_cfg.get("limit_gb")
-        limit_bytes = None
+        limit_tb = None
         if limit_gb:
             try:
-                limit_bytes = float(Decimal(limit_gb) * (Decimal(1024) ** 3))
+                limit_tb = (Decimal(limit_gb) / Decimal(1024)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
             except Exception:
-                limit_bytes = None
-        lines = ["🖥️ **服务器列表**"]
+                limit_tb = None
+        if not args:
+            servers = client.get_servers()
+            lines = ["📊 **流量汇总(出站计费)**"]
+            for s in servers:
+                detail = client.get_server(s["id"]) or {}
+                outgoing = detail.get("outgoing_traffic")
+                name = detail.get("name") or s.get("name") or s["id"]
+                if outgoing is None or not limit_tb:
+                    lines.append(f"- `{name}`")
+                    continue
+                total_tb = _bytes_to_tb(float(outgoing))
+                percent = float((Decimal(outgoing) / (Decimal(1024) ** 4) / limit_tb) * 100)
+                lines.append(f"- `{name}`: {total_tb} TB ({percent:.2f}%)")
+            return "\n".join(lines)
+
+        try:
+            sid = int(args[0])
+        except Exception:
+            return "⚠️ 用法: /traffic <ID>"
+        detail = client.get_server(sid)
+        if not detail:
+            return "❌ 服务器不存在"
+        outbound = detail.get("outgoing_traffic")
+        inbound = detail.get("ingoing_traffic")
+        outbound_tb = _bytes_to_tb(float(outbound)) if outbound is not None else Decimal("0.000")
+        inbound_tb = _bytes_to_tb(float(inbound)) if inbound is not None else Decimal("0.000")
+        usage = None
+        if limit_tb and outbound is not None:
+            usage = float((Decimal(outbound) / (Decimal(1024) ** 4) / limit_tb) * 100)
+        usage_text = f"{usage:.2f}%" if usage is not None else "N/A"
+        return (
+            f"📊 **流量详情**\n"
+            f"🖥 `{detail.get('name')}` (`{sid}`)\n"
+            f"📤 出站: {outbound_tb} TB\n"
+            f"📥 入站: {inbound_tb} TB\n"
+            f"📈 使用率: {usage_text}"
+        )
+
+    if command == "/today":
+        if not args:
+            servers = client.get_servers()
+            lines = ["📅 **今日流量**"]
+            for s in servers:
+                detail = client.get_server(s["id"]) or {}
+                name = detail.get("name") or s.get("name") or s["id"]
+                usage = _get_today_traffic_bytes(client, s["id"])
+                out_gb = Decimal(usage["out_bytes"]) / (Decimal(1024) ** 3)
+                in_gb = Decimal(usage["in_bytes"]) / (Decimal(1024) ** 3)
+                lines.append(f"- `{name}`: ⬆️ {out_gb:.2f} GB | ⬇️ {in_gb:.2f} GB")
+            return "\n".join(lines)
+        try:
+            sid = int(args[0])
+        except Exception:
+            return "⚠️ 用法: /today <ID>"
+        detail = client.get_server(sid)
+        if not detail:
+            return "❌ 服务器不存在"
+        usage = _get_today_traffic_bytes(client, sid)
+        out_gb = Decimal(usage["out_bytes"]) / (Decimal(1024) ** 3)
+        in_gb = Decimal(usage["in_bytes"]) / (Decimal(1024) ** 3)
+        return (
+            f"📅 **今日流量**\n"
+            f"🖥 `{detail.get('name')}` (`{sid}`)\n"
+            f"⬆️ {out_gb:.2f} GB | ⬇️ {in_gb:.2f} GB"
+        )
+
+    if command == "/report":
+        return _build_manual_report(config, client)
+
+    if command == "/reportstatus":
+        state = _load_report_state()
+        last_time = state.get("last_time")
+        return f"📋 上次汇报时间: {last_time}" if last_time else "📋 暂无汇报记录"
+
+    if command == "/reportreset":
+        _save_report_state({})
+        return "♻️ 已重置汇报区间"
+
+    if command == "/dnstest":
+        if not args:
+            return "⚠️ 用法: /dnstest <ID>"
+        try:
+            sid = int(args[0])
+        except Exception:
+            return "⚠️ 用法: /dnstest <ID>"
+        detail = client.get_server(sid)
+        if not detail:
+            return "❌ 服务器不存在"
+        cf_cfg = config.get("cloudflare", {}) or {}
+        record_cfg = (cf_cfg.get("record_map", {}) or {}).get(str(sid))
+        resolved = _resolve_cf_record(record_cfg, cf_cfg.get("zone_id", ""), cf_cfg.get("api_token", ""))
+        ip = detail.get("public_net", {}).get("ipv4", {}).get("ip")
+        if not resolved or not ip:
+            return "❌ DNS 配置缺失"
+        result = client.update_cloudflare_a_record(
+            resolved["api_token"], resolved["zone_id"], resolved["record"], ip
+        )
+        if result.get("success"):
+            return f"✅ DNS 已更新: {resolved['record']} -> {ip}"
+        return f"❌ DNS 更新失败: {result.get('error', '未知错误')}"
+
+    if command == "/dnscheck":
+        cf_cfg = config.get("cloudflare", {}) or {}
+        record_map = cf_cfg.get("record_map", {}) or {}
+        servers = client.get_servers()
+        if args:
+            try:
+                target_id = int(args[0])
+                servers = [s for s in servers if s["id"] == target_id]
+            except Exception:
+                return "⚠️ 用法: /dnscheck <ID>"
+        results = ["✅ **DNS 解析检查**"]
         for s in servers:
-            detail = client.get_server(s["id"]) or {}
-            name = detail.get("name") or s.get("name") or s["id"]
-            outgoing = detail.get("outgoing_traffic")
-            if outgoing is None or limit_bytes is None:
-                lines.append(f"- `{name}`")
+            record_cfg = record_map.get(str(s["id"]))
+            record = None
+            if isinstance(record_cfg, dict):
+                record = record_cfg.get("record") or record_cfg.get("name")
+            elif isinstance(record_cfg, str):
+                record = record_cfg
+            ip = s.get("public_net", {}).get("ipv4", {}).get("ip")
+            if not record or not ip:
+                results.append(f"- `{s.get('name') or s['id']}`: 缺少记录或IP")
                 continue
-            percent = (float(outgoing) / limit_bytes) * 100
-            outbound_tb = _bytes_to_tb(float(outgoing))
-            lines.append(f"- `{name}`: {outbound_tb} TB ({percent:.1f}%)")
+            try:
+                socket.setdefaulttimeout(5)
+                resolved = socket.gethostbyname(record)
+                ok = "✅" if resolved == ip else "❌"
+                results.append(f"- `{s.get('name')}`: {ok} {record} -> {resolved} (期望 {ip})")
+            except Exception as e:
+                results.append(f"- `{s.get('name')}`: ❌ {e}")
+        return "\n".join(results)
+
+    if command == "/startserver":
+        if not args:
+            return "⚠️ 用法: /startserver <ID>"
+        try:
+            sid = int(args[0])
+        except Exception:
+            return "⚠️ 用法: /startserver <ID>"
+        return "✅ 已启动" if client.power_on_server(sid) else "❌ 启动失败"
+
+    if command == "/stopserver":
+        if not args:
+            return "⚠️ 用法: /stopserver <ID>"
+        try:
+            sid = int(args[0])
+        except Exception:
+            return "⚠️ 用法: /stopserver <ID>"
+        return "✅ 已停止" if client.power_off_server(sid) else "❌ 停止失败"
+
+    if command == "/reboot":
+        if not args:
+            return "⚠️ 用法: /reboot <ID>"
+        try:
+            sid = int(args[0])
+        except Exception:
+            return "⚠️ 用法: /reboot <ID>"
+        return "✅ 已重启" if client.reboot_server(sid) else "❌ 重启失败"
+
+    if command == "/delete":
+        if len(args) < 2 or args[1].lower() != "confirm":
+            return "⚠️ 用法: /delete <ID> confirm"
+        try:
+            sid = int(args[0])
+        except Exception:
+            return "⚠️ 用法: /delete <ID> confirm"
+        return "✅ 已删除" if client.delete_server(sid) else "❌ 删除失败"
+
+    if command == "/rebuild":
+        if not args:
+            return "⚠️ 用法: /rebuild <ID>"
+        target = None
+        try:
+            sid = int(args[0])
+            target = client.get_server(sid)
+            if target:
+                name = target.get("name") or str(sid)
+                result = _perform_rebuild(sid, name, config, "Telegram 指令", client)
+            else:
+                return "❌ 服务器不存在"
+        except Exception:
+            name = " ".join(args).strip()
+            servers = client.get_servers()
+            match = next((s for s in servers if s.get("name") == name), None)
+            if not match:
+                return "❌ 服务器不存在"
+            result = _perform_rebuild(match["id"], name, config, "Telegram 指令", client)
+        if result.get("success"):
+            return "✅ 已触发重建"
+        return f"❌ 重建失败: {result.get('error', '未知错误')}"
+
+    if command == "/snapshots":
+        snapshots = client.get_snapshots()
+        if not snapshots:
+            return "📦 暂无快照"
+        lines = ["📦 **快照列表(最近10条)**"]
+        for s in snapshots[:10]:
+            created_from = (s.get("created_from") or {}).get("id")
+            created = s.get("created") or "N/A"
+            name = s.get("name") or s.get("description") or "snapshot"
+            lines.append(f"- `{s.get('id')}` {name} ({created_from or 'N/A'}) {created}")
         return "\n".join(lines)
-    if cmd.startswith("/dnsync"):
+
+    if command == "/createsnapshot":
+        if not args:
+            return "⚠️ 用法: /createsnapshot <ID>"
+        try:
+            sid = int(args[0])
+        except Exception:
+            return "⚠️ 用法: /createsnapshot <ID>"
+        description = " ".join(args[1:]).strip()
+        image = client.create_snapshot(sid, description=description)
+        if image:
+            return f"✅ 快照已触发: `{image.get('id')}`"
+        return "❌ 创建快照失败"
+
+    if command == "/scheduleon":
+        scheduler_cfg = config.get("scheduler", {}) or {}
+        scheduler_cfg["enabled"] = True
+        config["scheduler"] = scheduler_cfg
+        _save_yaml(CONFIG_PATH, config)
+        return "✅ 定时任务已开启"
+
+    if command == "/scheduleoff":
+        scheduler_cfg = config.get("scheduler", {}) or {}
+        scheduler_cfg["enabled"] = False
+        config["scheduler"] = scheduler_cfg
+        _save_yaml(CONFIG_PATH, config)
+        return "⏸️ 定时任务已关闭"
+
+    if command == "/schedulestatus":
+        scheduler_cfg = config.get("scheduler", {}) or {}
+        enabled = scheduler_cfg.get("enabled")
+        tasks = _normalize_scheduler_tasks(config)
+        if not tasks:
+            return f"📋 定时状态: {'开启' if enabled else '关闭'}\n无任务"
+        lines = [f"📋 定时状态: {'开启' if enabled else '关闭'}"]
+        now = _now_local()
+        for task in tasks:
+            action = task.get("action")
+            times = task.get("times") or []
+            if isinstance(times, str):
+                times = [times]
+            next_times = []
+            for t in times:
+                try:
+                    hh, mm = t.split(":", 1)
+                    target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+                    if target <= now:
+                        target = target + timedelta(days=1)
+                    next_times.append(target.strftime("%m-%d %H:%M"))
+                except Exception:
+                    next_times.append(t)
+            lines.append(f"- {action}: {', '.join(next_times)}")
+        return "\n".join(lines)
+
+    if command == "/scheduleset":
+        delete_times: List[str] = []
+        create_times: List[str] = []
+        for arg in args:
+            if "=" not in arg:
+                continue
+            key, value = arg.split("=", 1)
+            times = [t.strip() for t in value.split(",") if t.strip()]
+            if key == "delete":
+                delete_times = times
+            elif key == "create":
+                create_times = times
+        tasks: List[Dict[str, Any]] = []
+        if delete_times:
+            tasks.append({"action": "delete_all", "times": delete_times})
+        if create_times:
+            tasks.append({"action": "create_from_snapshots", "times": create_times})
+        scheduler_cfg = config.get("scheduler", {}) or {}
+        scheduler_cfg["enabled"] = True
+        scheduler_cfg["tasks"] = tasks
+        config["scheduler"] = scheduler_cfg
+        _save_yaml(CONFIG_PATH, config)
+        return "✅ 定时任务已更新"
+
+    if command == "/dnsync":
         result = _sync_cloudflare_records(config, client)
         return f"✅ DNS 同步完成，更新 {result['updated']} 项，跳过 {result['skipped']} 项"
-    if cmd.startswith("/rebuild"):
-        parts = cmd.split(maxsplit=1)
-        if len(parts) < 2:
-            return "⚠️ 用法: /rebuild 服务器名"
-        name = parts[1].strip()
-        servers = client.get_servers()
-        target = next((s for s in servers if s.get("name") == name), None)
-        if not target:
-            return "❌ 找不到该服务器"
-        result = _perform_rebuild(target["id"], name, config, "Telegram 指令", client)
-        if result.get("success"):
-            return f"✅ 已触发 {name} 重建"
-        return f"❌ 重建失败: {result.get('error', '未知错误')}"
+
     return "⚠️ 未知指令"
 
 
@@ -817,6 +1457,7 @@ def _start_traffic_monitor() -> None:
     threading.Thread(target=_monitor_traffic_loop, daemon=True).start()
     threading.Thread(target=_daily_report_loop, daemon=True).start()
     threading.Thread(target=_telegram_bot_loop, daemon=True).start()
+    threading.Thread(target=_schedule_loop, daemon=True).start()
     def _sync_wrapper() -> None:
         try:
             config = _load_yaml(CONFIG_PATH)
