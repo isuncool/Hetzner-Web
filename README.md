@@ -91,12 +91,22 @@ server {
 ### `config.yaml`
 - `hetzner.api_token`: Hetzner Cloud API token
 - `traffic.limit_gb`: traffic limit (GB)
+- `traffic.check_interval`: polling interval (minutes)
+- `traffic.exceed_action`: action on limit exceed (`rebuild` or empty)
+- `telegram.notify_levels`: alert thresholds (percent)
+- `telegram.daily_report_time`: daily report time (HH:MM)
+- `cloudflare.sync_on_start`: sync DNS on startup
 - `cloudflare.record_map`: server_id -> DNS record
 - `rebuild.snapshot_id_map`: server_id -> snapshot_id
 
 ### `web_config.json`
 - `username` / `password`: Basic Auth credentials
 - `tracking_start`: optional, e.g. `2026-01-01 00:00`
+
+## Telegram Commands
+
+- `/status` or `/ll`: send daily report
+- `/rebuild <server-name>`: trigger rebuild
 
 ## Security Notes
 

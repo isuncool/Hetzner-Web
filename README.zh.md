@@ -91,12 +91,22 @@ server {
 ### `config.yaml`
 - `hetzner.api_token`: Hetzner Cloud API token
 - `traffic.limit_gb`: 流量上限 (GB)
+- `traffic.check_interval`: 轮询频率（分钟）
+- `traffic.exceed_action`: 超限动作（`rebuild` 或留空）
+- `telegram.notify_levels`: 告警阈值（百分比）
+- `telegram.daily_report_time`: 每日战报时间（HH:MM）
+- `cloudflare.sync_on_start`: 启动时同步 DNS
 - `cloudflare.record_map`: server_id -> DNS 记录
 - `rebuild.snapshot_id_map`: server_id -> snapshot_id
 
 ### `web_config.json`
 - `username` / `password`: Basic Auth 凭据
 - `tracking_start`: 可选，如 `2026-01-01 00:00`
+
+## Telegram 命令
+
+- `/status` 或 `/ll`：发送今日战报
+- `/rebuild 服务器名`：触发重建
 
 ## 安全说明
 

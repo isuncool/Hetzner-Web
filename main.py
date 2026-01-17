@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import socket
+import threading
 import time
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -21,6 +22,11 @@ STATIC_DIR = os.path.join(APP_ROOT, "static")
 CONFIG_PATH = os.environ.get("HETZNER_CONFIG_PATH", "/app/config.yaml")
 WEB_CONFIG_PATH = os.environ.get("WEB_CONFIG_PATH", "/app/web_config.json")
 REPORT_STATE_PATH = os.environ.get("REPORT_STATE_PATH", "/app/report_state.json")
+
+ALERT_STATE: Dict[str, Dict[str, Optional[float]]] = {}
+REBUILD_LOCKS: Dict[str, threading.Lock] = {}
+SCHEDULE_STATE: Dict[str, Optional[str]] = {"last_daily_report": None}
+BOT_STATE: Dict[str, int] = {"update_offset": 0}
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -263,6 +269,14 @@ class HetznerClient:
         except Exception:
             return None
 
+    def get_server_metrics(self, server_id: int, start: str, end: str) -> Dict[str, Any]:
+        try:
+            params = {"type": "traffic", "start": start, "end": end}
+            data = self._request("GET", f"servers/{server_id}/metrics", params=params)
+            return data.get("metrics", {})
+        except Exception:
+            return {}
+
     def delete_server(self, server_id: int) -> bool:
         try:
             self._request("DELETE", f"servers/{server_id}")
@@ -388,8 +402,393 @@ def _require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _parse_alert_levels(raw_levels: Any) -> List[int]:
+    if isinstance(raw_levels, list):
+        levels = []
+        for item in raw_levels:
+            try:
+                levels.append(int(item))
+            except Exception:
+                continue
+        levels = [level for level in levels if level > 0]
+        if levels:
+            return sorted(set(levels))
+    return [80, 90, 95, 100]
+
+
+def _format_iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def _integrate_time_series(series: List[List[Any]]) -> float:
+    total = 0.0
+    if not series or len(series) < 2:
+        return 0.0
+    for i in range(len(series) - 1):
+        try:
+            value = float(series[i][1])
+            t_curr = datetime.fromisoformat(series[i][0].replace("Z", "+00:00"))
+            t_next = datetime.fromisoformat(series[i + 1][0].replace("Z", "+00:00"))
+            duration = (t_next - t_curr).total_seconds()
+            total += value * duration
+        except Exception:
+            continue
+    return total
+
+
+def _get_today_traffic_bytes(client: "HetznerClient", server_id: int) -> Dict[str, float]:
+    now = _now_local()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    metrics = client.get_server_metrics(server_id, start=_format_iso(start), end=_format_iso(now))
+    time_series = metrics.get("time_series", {}) if isinstance(metrics, dict) else {}
+    out_series = time_series.get("traffic.0.out", [])
+    in_series = time_series.get("traffic.0.in", [])
+    return {
+        "out_bytes": _integrate_time_series(out_series),
+        "in_bytes": _integrate_time_series(in_series),
+    }
+
+
+def _send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
+    if not bot_token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        resp = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=15)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[alert] telegram send failed: {e}")
+        return False
+
+
+def _send_telegram_markdown(bot_token: str, chat_id: str, text: str) -> bool:
+    if not bot_token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[alert] telegram send failed: {e}")
+        return False
+
+
+def _resolve_cf_record(record_cfg: Any, fallback_zone: str, fallback_token: str) -> Optional[Dict[str, str]]:
+    if isinstance(record_cfg, str):
+        return {"record": record_cfg, "zone_id": fallback_zone, "api_token": fallback_token}
+    if isinstance(record_cfg, dict):
+        record = record_cfg.get("record") or record_cfg.get("name")
+        zone_id = record_cfg.get("zone_id") or fallback_zone
+        api_token = record_cfg.get("api_token") or fallback_token
+        if record and zone_id and api_token:
+            return {"record": record, "zone_id": zone_id, "api_token": api_token}
+    return None
+
+
+def _build_daily_report(config: Dict[str, Any], client: "HetznerClient") -> str:
+    traffic_cfg = config.get("traffic", {})
+    limit_gb = traffic_cfg.get("limit_gb")
+    limit_bytes = None
+    if limit_gb:
+        try:
+            limit_bytes = float(Decimal(limit_gb) * (Decimal(1024) ** 3))
+        except Exception:
+            limit_bytes = None
+
+    servers = client.get_servers()
+    lines = [f"📅 **每日定时战报 ({_now_local().strftime('%Y-%m-%d')})**"]
+    for s in servers:
+        detail = client.get_server(s["id"]) or {}
+        outgoing = detail.get("outgoing_traffic")
+        ingoing = detail.get("ingoing_traffic")
+        if outgoing is None or ingoing is None:
+            lines.append(f"━━━━━━━━━━\n🖥️ `{s.get('name') or s['id']}`\n❌ 获取失败")
+            continue
+        usage = _get_today_traffic_bytes(client, s["id"])
+        percent = None
+        if limit_bytes:
+            percent = (float(outgoing) / limit_bytes) * 100
+        outbound_tb = _bytes_to_tb(float(outgoing))
+        inbound_tb = _bytes_to_tb(float(ingoing))
+        today_up_gb = Decimal(usage["out_bytes"]) / (Decimal(1024) ** 3)
+        today_down_gb = Decimal(usage["in_bytes"]) / (Decimal(1024) ** 3)
+        percent_text = f" ({percent:.2f}%)" if percent is not None else ""
+        lines.append(
+            "━━━━━━━━━━\n"
+            f"🖥️ `{detail.get('name') or s.get('name') or s['id']}`\n"
+            f"📤 总上传: `{outbound_tb} TB`{percent_text}\n"
+            f"📥 总下载: `{inbound_tb} TB`\n"
+            f"📈 **今日新增**: ⬆️ `{today_up_gb:.2f} GB` | ⬇️ `{today_down_gb:.2f} GB`"
+        )
+    return "\n".join(lines)
+
+
+def _perform_rebuild(
+    server_id: int, server_name: str, config: Dict[str, Any], source: str, client: "HetznerClient"
+) -> Dict[str, Any]:
+    lock = REBUILD_LOCKS.setdefault(str(server_id), threading.Lock())
+    if not lock.acquire(blocking=False):
+        return {"success": False, "error": "重建正在进行中"}
+    try:
+        telegram_cfg = config.get("telegram", {})
+        bot_token = telegram_cfg.get("bot_token", "")
+        chat_id = telegram_cfg.get("chat_id", "")
+        if telegram_cfg.get("enabled") and bot_token and chat_id:
+            _send_telegram_markdown(
+                bot_token,
+                chat_id,
+                f"🚨 **[{server_name}]** 触发重建 ({source})",
+            )
+
+        result = client.rebuild_server(server_id, config)
+        if not result.get("success"):
+            return result
+
+        cf_cfg = config.get("cloudflare", {})
+        record_cfg = (cf_cfg.get("record_map", {}) or {}).get(str(server_id))
+        resolved = _resolve_cf_record(record_cfg, cf_cfg.get("zone_id", ""), cf_cfg.get("api_token", ""))
+        dns_result = None
+        if resolved:
+            dns_result = client.update_cloudflare_a_record(
+                resolved["api_token"],
+                resolved["zone_id"],
+                resolved["record"],
+                result.get("new_ip", ""),
+            )
+        if telegram_cfg.get("enabled") and bot_token and chat_id:
+            dns_text = ""
+            if dns_result:
+                dns_text = "✅ DNS 已更新" if dns_result.get("success") else f"❌ DNS 失败: {dns_result.get('error')}"
+            _send_telegram_markdown(
+                bot_token,
+                chat_id,
+                f"✅ **[{server_name}]** 重建完成\nIP: `{result.get('new_ip')}`\n{dns_text}",
+            )
+        return {"success": True, "dns": dns_result}
+    finally:
+        lock.release()
+
+
+def _sync_cloudflare_records(config: Dict[str, Any], client: "HetznerClient") -> None:
+    cf_cfg = config.get("cloudflare", {})
+    if not cf_cfg.get("sync_on_start"):
+        return
+    record_map = cf_cfg.get("record_map", {}) or {}
+    if not record_map:
+        return
+    servers = client.get_servers()
+    for s in servers:
+        sid = str(s["id"])
+        record_cfg = record_map.get(sid) or record_map.get(s.get("name", ""))
+        resolved = _resolve_cf_record(record_cfg, cf_cfg.get("zone_id", ""), cf_cfg.get("api_token", ""))
+        if not resolved:
+            continue
+        ip = None
+        public_net = s.get("public_net", {})
+        if public_net.get("ipv4"):
+            ip = public_net["ipv4"].get("ip")
+        if not ip:
+            detail = client.get_server(s["id"]) or {}
+            if detail.get("public_net", {}).get("ipv4"):
+                ip = detail["public_net"]["ipv4"].get("ip")
+        if not ip:
+            continue
+        client.update_cloudflare_a_record(resolved["api_token"], resolved["zone_id"], resolved["record"], ip)
+
+
+def _monitor_traffic_loop() -> None:
+    while True:
+        try:
+            config = _load_yaml(CONFIG_PATH)
+            traffic_cfg = config.get("traffic", {})
+            telegram_cfg = config.get("telegram", {})
+            enabled = bool(telegram_cfg.get("enabled"))
+            limit_gb = traffic_cfg.get("limit_gb")
+            bot_token = telegram_cfg.get("bot_token", "")
+            chat_id = telegram_cfg.get("chat_id", "")
+            exceed_action = traffic_cfg.get("exceed_action", "")
+            check_interval = traffic_cfg.get("check_interval", 5)
+            interval_seconds = max(30, int(check_interval) * 60)
+
+            if not limit_gb:
+                time.sleep(interval_seconds)
+                continue
+
+            try:
+                limit_bytes = float(Decimal(limit_gb) * (Decimal(1024) ** 3))
+            except Exception:
+                time.sleep(interval_seconds)
+                continue
+
+            levels = _parse_alert_levels(telegram_cfg.get("notify_levels"))
+            client = HetznerClient(config["hetzner"]["api_token"])
+            servers = client.get_servers()
+
+            for s in servers:
+                sid = str(s["id"])
+                detail = client.get_server(s["id"]) or {}
+                outgoing = detail.get("outgoing_traffic")
+                if outgoing is None:
+                    continue
+                percent = (float(outgoing) / limit_bytes) * 100
+                state = ALERT_STATE.setdefault(
+                    sid, {"last_level": 0, "last_outgoing": None, "auto_rebuild": False}
+                )
+                last_outgoing = state.get("last_outgoing")
+                if last_outgoing is not None and float(outgoing) < float(last_outgoing):
+                    state["last_level"] = 0
+                    state["auto_rebuild"] = False
+                state["last_outgoing"] = float(outgoing)
+
+                reached = [level for level in levels if percent >= level]
+                if not reached:
+                    continue
+                new_level = max(reached)
+                if int(new_level) <= int(state.get("last_level") or 0):
+                    continue
+
+                outbound_tb = _bytes_to_tb(float(outgoing))
+                server_name = detail.get("name") or s.get("name") or sid
+                message = (
+                    f"[Hetzner-Web] {server_name} 流量提醒: {new_level}%\n"
+                    f"出站: {outbound_tb} TB\n"
+                    f"阈值: {limit_gb} GB"
+                )
+                if enabled and bot_token and chat_id:
+                    if _send_telegram_message(bot_token, chat_id, message):
+                        state["last_level"] = int(new_level)
+
+                if exceed_action == "rebuild" and float(outgoing) >= limit_bytes:
+                    if not state.get("auto_rebuild"):
+                        server_name = detail.get("name") or s.get("name") or sid
+                        result = _perform_rebuild(
+                            s["id"],
+                            server_name,
+                            config,
+                            "流量超标自动重建",
+                            client,
+                        )
+                        if result.get("success"):
+                            state["auto_rebuild"] = True
+        except Exception as e:
+            print(f"[alert] monitor error: {e}")
+        time.sleep(interval_seconds)
+
+
+def _daily_report_loop() -> None:
+    while True:
+        try:
+            config = _load_yaml(CONFIG_PATH)
+            telegram_cfg = config.get("telegram", {})
+            if not telegram_cfg.get("enabled"):
+                time.sleep(30)
+                continue
+            daily_time = telegram_cfg.get("daily_report_time")
+            bot_token = telegram_cfg.get("bot_token", "")
+            chat_id = telegram_cfg.get("chat_id", "")
+            if not daily_time or not bot_token or not chat_id:
+                time.sleep(30)
+                continue
+            now = _now_local()
+            current_time = now.strftime("%H:%M")
+            current_date = now.strftime("%Y-%m-%d")
+            if current_time == daily_time and SCHEDULE_STATE.get("last_daily_report") != current_date:
+                client = HetznerClient(config["hetzner"]["api_token"])
+                report = _build_daily_report(config, client)
+                _send_telegram_markdown(bot_token, chat_id, report)
+                SCHEDULE_STATE["last_daily_report"] = current_date
+        except Exception as e:
+            print(f"[alert] daily report error: {e}")
+        time.sleep(30)
+
+
+def _handle_bot_command(text: str, config: Dict[str, Any], client: "HetznerClient") -> str:
+    cmd = (text or "").strip()
+    if cmd.startswith("/start") or cmd.startswith("/help"):
+        return "🤖 监控已启动\n/status 或 /ll 查看战报\n/rebuild 服务器名 执行重建"
+    if cmd.startswith("/ll") or cmd.startswith("/status"):
+        return _build_daily_report(config, client)
+    if cmd.startswith("/rebuild"):
+        parts = cmd.split(maxsplit=1)
+        if len(parts) < 2:
+            return "⚠️ 用法: /rebuild 服务器名"
+        name = parts[1].strip()
+        servers = client.get_servers()
+        target = next((s for s in servers if s.get("name") == name), None)
+        if not target:
+            return "❌ 找不到该服务器"
+        result = _perform_rebuild(target["id"], name, config, "Telegram 指令", client)
+        if result.get("success"):
+            return f"✅ 已触发 {name} 重建"
+        return f"❌ 重建失败: {result.get('error', '未知错误')}"
+    return "⚠️ 未知指令"
+
+
+def _telegram_bot_loop() -> None:
+    while True:
+        try:
+            config = _load_yaml(CONFIG_PATH)
+            telegram_cfg = config.get("telegram", {})
+            if not telegram_cfg.get("enabled"):
+                time.sleep(10)
+                continue
+            bot_token = telegram_cfg.get("bot_token", "")
+            chat_id = str(telegram_cfg.get("chat_id", "")).strip()
+            if not bot_token or not chat_id:
+                time.sleep(10)
+                continue
+
+            offset = BOT_STATE.get("update_offset", 0)
+            url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+            resp = requests.get(url, params={"timeout": 25, "offset": offset}, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("ok"):
+                time.sleep(10)
+                continue
+            for update in data.get("result", []):
+                update_id = update.get("update_id")
+                if update_id is not None:
+                    BOT_STATE["update_offset"] = update_id + 1
+                message = update.get("message") or {}
+                if not message:
+                    continue
+                if str(message.get("chat", {}).get("id")) != chat_id:
+                    continue
+                text = message.get("text", "")
+                if not text:
+                    continue
+                client = HetznerClient(config["hetzner"]["api_token"])
+                reply = _handle_bot_command(text, config, client)
+                _send_telegram_markdown(bot_token, chat_id, reply)
+        except Exception as e:
+            print(f"[alert] telegram bot error: {e}")
+        time.sleep(3)
+
+
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.on_event("startup")
+def _start_traffic_monitor() -> None:
+    threading.Thread(target=_monitor_traffic_loop, daemon=True).start()
+    threading.Thread(target=_daily_report_loop, daemon=True).start()
+    threading.Thread(target=_telegram_bot_loop, daemon=True).start()
+    def _sync_wrapper() -> None:
+        try:
+            config = _load_yaml(CONFIG_PATH)
+            client = HetznerClient(config["hetzner"]["api_token"])
+            _sync_cloudflare_records(config, client)
+        except Exception as e:
+            print(f"[alert] cloudflare sync error: {e}")
+    threading.Thread(target=_sync_wrapper, daemon=True).start()
 
 
 @app.get("/")

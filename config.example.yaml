@@ -15,10 +15,13 @@ telegram:
   enabled: false
   bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
   chat_id: "YOUR_TELEGRAM_CHAT_ID"
+  notify_levels: [80, 90, 95, 100]
+  daily_report_time: "23:55"
 
 cloudflare:
   api_token: "YOUR_CLOUDFLARE_API_TOKEN"
   zone_id: "YOUR_CLOUDFLARE_ZONE_ID"
+  sync_on_start: false
   record_map:
     "SERVER_ID_1": "server-a.example.com"
     "SERVER_ID_2": "server-b.example.com"
