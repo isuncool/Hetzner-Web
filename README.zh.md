@@ -49,6 +49,23 @@ docker compose up -d --build
 
 打开：`http://<server-ip>:1227`
 
+## 一键安装 (Docker)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/scripts/install-docker.sh | bash
+```
+
+可选环境变量：
+- `INSTALL_DIR`：安装目录（默认 `/opt/hetzner-web`）
+- `BRANCH`：分支（默认 `main`）
+- `REPO_URL`：仓库地址
+
+示例：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/scripts/install-docker.sh | INSTALL_DIR=/srv/hetzner-web bash
+```
+
 ## 反向代理 (Nginx 示例)
 
 ```nginx

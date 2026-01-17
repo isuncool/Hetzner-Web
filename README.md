@@ -49,6 +49,23 @@ docker compose up -d --build
 
 Open: `http://<server-ip>:1227`
 
+## One-line Install (Docker)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/scripts/install-docker.sh | bash
+```
+
+Optional env vars:
+- `INSTALL_DIR`: install directory (default `/opt/hetzner-web`)
+- `BRANCH`: git branch (default `main`)
+- `REPO_URL`: repo URL
+
+Example:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/scripts/install-docker.sh | INSTALL_DIR=/srv/hetzner-web bash
+```
+
 ## Reverse Proxy (Nginx example)
 
 ```nginx
