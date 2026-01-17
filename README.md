@@ -66,6 +66,16 @@ Example:
 curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/scripts/install-docker.sh | INSTALL_DIR=/srv/hetzner-web bash
 ```
 
+## Automation (CLI/Systemd)
+
+The original Hetzner automation monitor is now bundled in this repo under `automation/`.
+
+- Entry point: `automation/main.py`
+- Install docs: `automation/INSTALL.md` (English), `automation/INSTALL_CN.md` (中文)
+- One-line install (from this repo): `automation/install_hetzner_monitor.sh`
+
+This keeps the web dashboard and the automation service in one repository while remaining independently runnable.
+
 ## Reverse Proxy (Nginx example)
 
 ```nginx

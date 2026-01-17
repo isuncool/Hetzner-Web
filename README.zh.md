@@ -66,6 +66,16 @@ curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/sc
 curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/scripts/install-docker.sh | INSTALL_DIR=/srv/hetzner-web bash
 ```
 
+## 自动化监控 (CLI/Systemd)
+
+原 Hetzner 自动化监控项目已合并到本仓库的 `automation/` 目录。
+
+- 入口：`automation/main.py`
+- 安装文档：`automation/INSTALL.md`（English）、`automation/INSTALL_CN.md`（中文）
+- 一键安装脚本：`automation/install_hetzner_monitor.sh`
+
+这样可以在同一个仓库中维护 Web 控制台与自动化服务，互不影响。
+
 ## 反向代理 (Nginx 示例)
 
 ```nginx
