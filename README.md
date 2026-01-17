@@ -12,6 +12,14 @@ A lightweight Hetzner traffic console with daily/hourly views, rebuild actions, 
 Hetzner Web is a focused control room for traffic visibility on Hetzner Cloud. It turns raw traffic data into daily and
 hourly insights, highlights cap risk, and keeps rebuild/DNS actions close to the charts so you can react fast.
 
+## Navigation
+
+- Web dashboard quick install:
+  `curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/scripts/install-docker.sh | bash`
+- Automation monitor quick install:
+  `curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/automation/install_hetzner_monitor.sh | sudo bash`
+- Automation docs: `automation/README.md`
+
 ## Screenshot
 
 ![Dashboard](docs/screenshot.png)

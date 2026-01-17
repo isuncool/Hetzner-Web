@@ -12,6 +12,14 @@
 Hetzner Web 是面向 Hetzner Cloud 的流量可视化控制室。它把原始流量数据整理成日/小时洞察，
 突出流量触顶风险，并把重建/DNS 操作放在图表旁边，方便快速处理。
 
+## 导航
+
+- Web 控制台快速安装：
+  `curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/scripts/install-docker.sh | bash`
+- 自动化监控快速安装：
+  `curl -fsSL https://raw.githubusercontent.com/liuweiqiang0523/Hetzner-Web/main/automation/install_hetzner_monitor.sh | sudo bash`
+- 自动化文档：`automation/README_CN.md`
+
 ## 截图
 
 ![Dashboard](docs/screenshot.png)
