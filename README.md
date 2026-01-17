@@ -96,7 +96,7 @@ server {
 - `telegram.notify_levels`: alert thresholds (percent)
 - `telegram.daily_report_time`: daily report time (HH:MM)
 - `cloudflare.sync_on_start`: sync DNS on startup
-- `cloudflare.record_map`: server_id -> DNS record
+- `cloudflare.record_map`: server_id or server_name -> DNS record
 - `rebuild.snapshot_id_map`: server_id -> snapshot_id
 
 ### `web_config.json`
@@ -106,7 +106,11 @@ server {
 ## Telegram Commands
 
 - `/status` or `/ll`: send daily report
+- `/servers`: list server traffic overview
+- `/dnsync`: sync Cloudflare DNS
 - `/rebuild <server-name>`: trigger rebuild
+
+> `cloudflare.record_map` can be an object: `{ record, zone_id, api_token }` for per-server zones.
 
 ## Security Notes
 

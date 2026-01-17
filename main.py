@@ -575,19 +575,22 @@ def _perform_rebuild(
         lock.release()
 
 
-def _sync_cloudflare_records(config: Dict[str, Any], client: "HetznerClient") -> None:
+def _sync_cloudflare_records(config: Dict[str, Any], client: "HetznerClient") -> Dict[str, int]:
     cf_cfg = config.get("cloudflare", {})
     if not cf_cfg.get("sync_on_start"):
-        return
+        return {"updated": 0, "skipped": 0}
     record_map = cf_cfg.get("record_map", {}) or {}
     if not record_map:
-        return
+        return {"updated": 0, "skipped": 0}
     servers = client.get_servers()
+    updated = 0
+    skipped = 0
     for s in servers:
         sid = str(s["id"])
         record_cfg = record_map.get(sid) or record_map.get(s.get("name", ""))
         resolved = _resolve_cf_record(record_cfg, cf_cfg.get("zone_id", ""), cf_cfg.get("api_token", ""))
         if not resolved:
+            skipped += 1
             continue
         ip = None
         public_net = s.get("public_net", {})
@@ -598,8 +601,16 @@ def _sync_cloudflare_records(config: Dict[str, Any], client: "HetznerClient") ->
             if detail.get("public_net", {}).get("ipv4"):
                 ip = detail["public_net"]["ipv4"].get("ip")
         if not ip:
+            skipped += 1
             continue
-        client.update_cloudflare_a_record(resolved["api_token"], resolved["zone_id"], resolved["record"], ip)
+        result = client.update_cloudflare_a_record(
+            resolved["api_token"], resolved["zone_id"], resolved["record"], ip
+        )
+        if result.get("success"):
+            updated += 1
+        else:
+            skipped += 1
+    return {"updated": updated, "skipped": skipped}
 
 
 def _monitor_traffic_loop() -> None:
@@ -711,9 +722,34 @@ def _daily_report_loop() -> None:
 def _handle_bot_command(text: str, config: Dict[str, Any], client: "HetznerClient") -> str:
     cmd = (text or "").strip()
     if cmd.startswith("/start") or cmd.startswith("/help"):
-        return "🤖 监控已启动\n/status 或 /ll 查看战报\n/rebuild 服务器名 执行重建"
+        return "🤖 监控已启动\n/status 或 /ll 查看战报\n/servers 查看服务器\n/dnsync 同步 DNS\n/rebuild 服务器名 执行重建"
     if cmd.startswith("/ll") or cmd.startswith("/status"):
         return _build_daily_report(config, client)
+    if cmd.startswith("/servers"):
+        servers = client.get_servers()
+        traffic_cfg = config.get("traffic", {})
+        limit_gb = traffic_cfg.get("limit_gb")
+        limit_bytes = None
+        if limit_gb:
+            try:
+                limit_bytes = float(Decimal(limit_gb) * (Decimal(1024) ** 3))
+            except Exception:
+                limit_bytes = None
+        lines = ["🖥️ **服务器列表**"]
+        for s in servers:
+            detail = client.get_server(s["id"]) or {}
+            name = detail.get("name") or s.get("name") or s["id"]
+            outgoing = detail.get("outgoing_traffic")
+            if outgoing is None or limit_bytes is None:
+                lines.append(f"- `{name}`")
+                continue
+            percent = (float(outgoing) / limit_bytes) * 100
+            outbound_tb = _bytes_to_tb(float(outgoing))
+            lines.append(f"- `{name}`: {outbound_tb} TB ({percent:.1f}%)")
+        return "\n".join(lines)
+    if cmd.startswith("/dnsync"):
+        result = _sync_cloudflare_records(config, client)
+        return f"✅ DNS 同步完成，更新 {result['updated']} 项，跳过 {result['skipped']} 项"
     if cmd.startswith("/rebuild"):
         parts = cmd.split(maxsplit=1)
         if len(parts) < 2:

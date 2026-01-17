@@ -96,7 +96,7 @@ server {
 - `telegram.notify_levels`: 告警阈值（百分比）
 - `telegram.daily_report_time`: 每日战报时间（HH:MM）
 - `cloudflare.sync_on_start`: 启动时同步 DNS
-- `cloudflare.record_map`: server_id -> DNS 记录
+- `cloudflare.record_map`: server_id 或 server_name -> DNS 记录
 - `rebuild.snapshot_id_map`: server_id -> snapshot_id
 
 ### `web_config.json`
@@ -106,7 +106,11 @@ server {
 ## Telegram 命令
 
 - `/status` 或 `/ll`：发送今日战报
+- `/servers`：列出服务器流量概览
+- `/dnsync`：同步 Cloudflare DNS
 - `/rebuild 服务器名`：触发重建
+
+> `cloudflare.record_map` 支持对象格式：`{ record, zone_id, api_token }`，可为不同服务器配置不同 Zone。
 
 ## 安全说明
 
